@@ -1,0 +1,115 @@
+stages:
+  - build
+  - test
+  - package
+  - deploy
+
+variables:
+  FRONTEND_IMAGE: "$CI_REGISTRY_IMAGE/frontend:$CI_COMMIT_SHORT_SHA"
+  BACKEND_IMAGE: "$CI_REGISTRY_IMAGE/backend:$CI_COMMIT_SHORT_SHA"
+  DOCKER_TLS_CERTDIR: ""
+
+build_applications:
+  stage: build
+  image: node:20-bullseye
+  script:
+    - npm --prefix frontend install
+    - npm --prefix backend install
+    - npm --prefix frontend run build
+    - npm --prefix backend run build
+  artifacts:
+    paths:
+      - frontend/dist/
+      - backend/dist/
+    expire_in: 1 week
+
+backend_tests:
+  stage: test
+  image: node:20-bullseye
+  script:
+    - npm --prefix backend install
+    - npm --prefix backend test
+
+cypress_tests:
+  stage: test
+  image: cypress/included:13.15.0
+  services:
+    - name: postgres:15-alpine
+      alias: postgres
+  variables:
+    POSTGRES_DB: devopsdb
+    POSTGRES_USER: devops
+    POSTGRES_PASSWORD: devops
+  script:
+    - npm --prefix backend install
+    - npm --prefix frontend install
+    - npm --prefix tests install
+    - |
+      BACKEND_PID=""
+      FRONTEND_PID=""
+
+      cleanup() {
+        if [ -n "$FRONTEND_PID" ]; then
+          kill "$FRONTEND_PID" 2>/dev/null || true
+        fi
+
+        if [ -n "$BACKEND_PID" ]; then
+          kill "$BACKEND_PID" 2>/dev/null || true
+        fi
+      }
+
+      trap cleanup EXIT
+
+      export DB_HOST=postgres
+      export DB_PORT=5432
+      export DB_NAME="$POSTGRES_DB"
+      export DB_USER="$POSTGRES_USER"
+      export DB_PASSWORD="$POSTGRES_PASSWORD"
+      export PORT=3000
+
+      node backend/src/server.js &
+      BACKEND_PID=$!
+
+      VITE_BACKEND_PROXY=http://localhost:3000 npm --prefix frontend run dev &
+      FRONTEND_PID=$!
+
+      npx --prefix tests wait-on http://localhost:3000/api/health http://localhost:5173
+      CYPRESS_BASE_URL=http://127.0.0.1:5173 npx --prefix tests cypress run
+  artifacts:
+    when: always
+    paths:
+      - tests/cypress/screenshots/
+      - tests/cypress/videos/
+    expire_in: 1 week
+
+package_images:
+  stage: package
+  image: docker:27.5.1
+  services:
+    - name: docker:27.5.1-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+  script:
+    - docker build -t "$FRONTEND_IMAGE" ./frontend
+    - docker build -t "$BACKEND_IMAGE" ./backend
+    - docker push "$FRONTEND_IMAGE"
+    - docker push "$BACKEND_IMAGE"
+    - docker tag "$FRONTEND_IMAGE" "$CI_REGISTRY_IMAGE/frontend:latest"
+    - docker tag "$BACKEND_IMAGE" "$CI_REGISTRY_IMAGE/backend:latest"
+    - docker push "$CI_REGISTRY_IMAGE/frontend:latest"
+    - docker push "$CI_REGISTRY_IMAGE/backend:latest"
+
+deploy_production:
+  stage: deploy
+  image: alpine:3.20
+  before_script:
+    - apk add --no-cache bash openssh-client
+    - chmod +x deploy.sh
+  script:
+    - ./deploy.sh
+  environment:
+    name: production
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
