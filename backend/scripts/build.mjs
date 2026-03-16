@@ -8,3 +8,4 @@ mkdirSync("dist", { recursive: true });
 cpSync("src", "dist", { recursive: true });
 
 console.log("Backend build completed.");
+console.log("Backend build completed.");
